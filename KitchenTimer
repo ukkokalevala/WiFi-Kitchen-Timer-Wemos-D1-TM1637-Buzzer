@@ -1,0 +1,348 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <TM1637Display.h>
+
+// ---------- WiFi credentials ----------
+const char* WIFI_SSID = "YOUR_SSID";
+const char* WIFI_PASS = "YOUR_PASSWORD";
+
+// ---------- Pins ----------
+#define CLK_PIN  D1
+#define DIO_PIN  D2
+#define BUZZER   D5
+
+// ---------- Buzzer config ----------
+bool passiveBuzzer = true;   // false if you ever use an active buzzer
+int  buzzFreq      = 2000;   // resonant frequency, tune via tester
+
+// ---------- Objects ----------
+TM1637Display display(CLK_PIN, DIO_PIN);
+ESP8266WebServer server(80);
+
+// ---------- Timer state ----------
+enum TimerState { IDLE, RUNNING, PAUSED, DONE };
+TimerState state = IDLE;
+
+unsigned long totalMs     = 0;
+unsigned long remainingMs = 0;
+unsigned long startMillis = 0;
+bool beepOn = false;
+
+// ---------- Tester state ----------
+bool testerActive = false;
+unsigned long testerUntil = 0;
+
+// ---------- Buzzer helpers ----------
+void buzzerOn(int freq) {
+  if (passiveBuzzer) tone(BUZZER, freq);
+  else digitalWrite(BUZZER, HIGH);
+}
+void buzzerOff() {
+  if (passiveBuzzer) noTone(BUZZER);
+  else digitalWrite(BUZZER, LOW);
+}
+void stopBuzzer() { buzzerOff(); beepOn = false; }
+
+// ---------- Timer helpers ----------
+unsigned long currentRemaining() {
+  if (state == RUNNING) {
+    unsigned long elapsed = millis() - startMillis;
+    if (elapsed >= remainingMs) return 0;
+    return remainingMs - elapsed;
+  }
+  return remainingMs;
+}
+
+void updateDisplay(unsigned long msLeft) {
+  unsigned long totalSec = (msLeft + 999) / 1000;
+  int mm = totalSec / 60;
+  int ss = totalSec % 60;
+  if (mm > 99) { mm = 99; ss = 99; }
+  uint8_t dots = (state == RUNNING) ? 0b01000000 : 0;
+  display.showNumberDecEx(mm * 100 + ss, dots, true, 4, 0);
+}
+
+// ---------- HTML page ----------
+const char PAGE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kitchen Timer</title>
+<style>
+  body{font-family:Arial,sans-serif;background:#111;color:#eee;text-align:center;padding:20px;}
+  h1{color:#4fc3f7;}
+  h2{color:#ffb74d;margin-top:40px;}
+  #time{font-size:72px;font-family:monospace;margin:20px;color:#8bc34a;}
+  input{font-size:24px;width:70px;text-align:center;padding:6px;border-radius:8px;border:none;}
+  button{font-size:20px;padding:12px 24px;margin:8px;border:none;border-radius:10px;cursor:pointer;}
+  .start{background:#4caf50;color:#fff;}
+  .stop{background:#f44336;color:#fff;}
+  .reset{background:#607d8b;color:#fff;}
+  .status{font-size:18px;color:#ffb74d;margin:10px;min-height:24px;}
+</style></head><body>
+<h1>Kitchen Timer</h1>
+<div id="time">00:00</div>
+<div class="status" id="status">Idle</div>
+<div>
+  <input type="number" id="min" min="0" max="99" value="5"> min
+  <input type="number" id="sec" min="0" max="59" value="0"> sec
+</div>
+<div>
+  <button type="button" class="start" onclick="setTime()">Set Time</button>
+  <button type="button" class="start" onclick="cmd('start')">Start</button>
+  <button type="button" class="stop"  onclick="cmd('pause')">Pause</button>
+  <button type="button" class="reset" onclick="cmd('reset')">Reset</button>
+</div>
+
+<h2>Buzzer Tester</h2>
+<div>
+  Freq (Hz): <input type="number" id="freq" value="2000" min="100" max="8000">
+  Duration (ms): <input type="number" id="dur" value="300" min="50" max="3000">
+  <button type="button" class="start" onclick="beep()">Beep</button>
+</div>
+<div style="margin-top:10px;">
+  Presets:
+  <button type="button" class="reset" onclick="quick(1000)">1 kHz</button>
+  <button type="button" class="reset" onclick="quick(2000)">2 kHz</button>
+  <button type="button" class="reset" onclick="quick(2700)">2.7 kHz</button>
+  <button type="button" class="reset" onclick="quick(4000)">4 kHz</button>
+</div>
+<div style="margin-top:10px;">
+  <button type="button" class="reset" onclick="sweep()">Sweep 500-4000 Hz</button>
+</div>
+
+<script>
+function ajax(url, cb){
+  var x = new XMLHttpRequest();
+  x.open('GET', url, true);
+  x.onreadystatechange = function(){
+    if (x.readyState === 4){
+      if (x.status === 200 && cb) cb(x.responseText);
+      else if (x.status !== 200){
+        document.getElementById('status').textContent =
+          'Error ' + x.status + ' on ' + url;
+      }
+    }
+  };
+  x.send();
+}
+
+function pad2(n){ return n < 10 ? '0' + n : '' + n; }
+
+function cmd(a){ ajax('/cmd?action=' + a); }
+
+function setTime(){
+  var m = document.getElementById('min').value || 0;
+  var s = document.getElementById('sec').value || 0;
+  ajax('/set?min=' + m + '&sec=' + s, function(){ poll(); });
+}
+
+function beep(){
+  var f = document.getElementById('freq').value;
+  var d = document.getElementById('dur').value;
+  ajax('/beep?freq=' + f + '&ms=' + d);
+}
+
+function quick(f){
+  document.getElementById('freq').value = f;
+  beep();
+}
+
+function sweep(){
+  var freqs = [500,800,1000,1500,2000,2500,3000,3500,4000];
+  var i = 0;
+  var t = setInterval(function(){
+    if (i >= freqs.length){ clearInterval(t); return; }
+    ajax('/beep?freq=' + freqs[i] + '&ms=250');
+    i++;
+  }, 400);
+}
+
+function poll(){
+  ajax('/status', function(txt){
+    try {
+      var d = JSON.parse(txt);
+      var mm = pad2(Math.floor(d.remaining/60));
+      var ss = pad2(d.remaining % 60);
+      document.getElementById('time').textContent = mm + ':' + ss;
+      document.getElementById('status').textContent = d.state;
+    } catch(e) {
+      document.getElementById('status').textContent = 'Bad JSON: ' + txt;
+    }
+  });
+}
+
+setInterval(poll, 500);
+poll();
+</script></body></html>
+)rawliteral";
+
+// ---------- Web handlers ----------
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send_P(200, "text/html", PAGE_HTML);
+}
+
+void handleSet() {
+  int m = server.arg("min").toInt();
+  int s = server.arg("sec").toInt();
+  if (m < 0) m = 0;
+  if (m > 99) m = 99;
+  if (s < 0) s = 0;
+  if (s > 59) s = 59;
+  remainingMs = ((unsigned long)m * 60 + s) * 1000UL;
+  totalMs = remainingMs;
+  state = (remainingMs > 0) ? PAUSED : IDLE;
+  stopBuzzer();
+  Serial.print("SET: "); Serial.print(m); Serial.print("m ");
+  Serial.print(s); Serial.println("s");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCmd() {
+  String a = server.arg("action");
+  Serial.print("CMD: "); Serial.println(a);
+  if (a == "start") {
+    if (remainingMs > 0) {
+      startMillis = millis();
+      state = RUNNING;
+      stopBuzzer();
+    }
+  } else if (a == "pause") {
+    if (state == RUNNING) {
+      remainingMs = currentRemaining();
+      state = PAUSED;
+    }
+  } else if (a == "reset") {
+    remainingMs = totalMs;
+    state = (remainingMs > 0) ? PAUSED : IDLE;
+    stopBuzzer();
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStatus() {
+  unsigned long remMs = currentRemaining();
+  unsigned long remSec = (remMs + 999) / 1000;
+  const char* s = "Idle";
+  switch (state) {
+    case IDLE: s = "Idle"; break;
+    case RUNNING: s = "Running"; break;
+    case PAUSED: s = "Paused"; break;
+    case DONE: s = "Done!"; break;
+  }
+  String json = "{\"state\":\"";
+  json += s;
+  json += "\",\"remaining\":";
+  json += remSec;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleBeep() {
+  int freq = server.arg("freq").toInt();
+  int ms   = server.arg("ms").toInt();
+  if (freq < 100)  freq = 100;
+  if (freq > 8000) freq = 8000;
+  if (ms   < 50)   ms   = 50;
+  if (ms   > 3000) ms   = 3000;
+
+  testerActive = true;
+  testerUntil  = millis() + ms;
+  buzzerOn(freq);
+  Serial.print("BEEP: "); Serial.print(freq);
+  Serial.print(" Hz "); Serial.print(ms); Serial.println(" ms");
+  server.send(200, "text/plain", "OK");
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n\nBooting kitchen timer...");
+
+  pinMode(BUZZER, OUTPUT);
+  buzzerOff();
+  display.setBrightness(5);
+  display.clear();
+  display.showNumberDec(8888, true);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    int last = WiFi.localIP()[3];
+    display.showNumberDec(last, false);
+    delay(1500);
+  } else {
+    Serial.println("WiFi failed - standalone timer only");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.on("/cmd", handleCmd);
+  server.on("/status", handleStatus);
+  server.on("/beep", handleBeep);
+  server.onNotFound([](){
+    Serial.print("404: "); Serial.println(server.uri());
+    server.send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  Serial.println("Server started");
+  Serial.print("Open: http://"); Serial.println(WiFi.localIP());
+}
+
+// ---------- Main loop ----------
+unsigned long lastDisplay = 0;
+unsigned long donePhase   = 0;
+
+void loop() {
+  server.handleClient();
+
+  if (testerActive && millis() >= testerUntil) {
+    buzzerOff();
+    testerActive = false;
+  }
+
+  if (state == RUNNING && currentRemaining() == 0) {
+    state = DONE;
+    remainingMs = 0;
+    donePhase = millis();
+  }
+
+  if (millis() - lastDisplay > 200) {
+    lastDisplay = millis();
+    unsigned long rem = currentRemaining();
+
+    if (state == DONE) {
+      static bool flash = false;
+      flash = !flash;
+      if (flash) display.showNumberDecEx(0, 0, true, 4, 0);
+      else       display.clear();
+    } else if (state == IDLE) {
+      display.showNumberDecEx(0, 0b01000000, true, 4, 0);
+    } else {
+      updateDisplay(rem);
+    }
+  }
+
+  if (state == DONE) {
+    unsigned long since = millis() - donePhase;
+    if (since < 10000) {
+      beepOn = ((since / 400) % 2) == 0;
+      if (beepOn && !testerActive) buzzerOn(buzzFreq);
+      else if (!testerActive)      buzzerOff();
+    } else {
+      if (!testerActive) buzzerOff();
+    }
+  } else {
+    if (!testerActive) buzzerOff();
+  }
+}
